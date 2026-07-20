@@ -1,0 +1,147 @@
+import { app } from "../../scripts/app.js";
+
+function createTextareaWidget(node, name) {
+  const widget = node.widgets?.find((widget) => widget.name === name);
+  if (widget) {
+    widget.serialize = false;
+  }
+  return widget;
+}
+
+function setWidgetValue(widget, value) {
+  const text = value ?? "";
+  if (!widget) {
+    return;
+  }
+  widget.value = text;
+  if (widget.inputEl) {
+    widget.inputEl.value = text;
+  }
+}
+
+app.registerExtension({
+  name: "dtv.restore.prompts",
+  beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData.name !== "DTVReadPromptsFromPNGMetadata") {
+      return;
+    }
+
+    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      const result = onNodeCreated?.apply(this, arguments);
+      this._dtvTextWidgets = {
+        parameters: createTextareaWidget(this, "parameters"),
+      };
+      for (const widget of Object.values(this._dtvTextWidgets)) {
+        if (widget) {
+          widget.serialize = false;
+        }
+      }
+      requestAnimationFrame(() => {
+        refreshMetadata.call(this);
+      });
+      this._dtvImageWatchTimer = window.setInterval(() => {
+        refreshMetadataIfImageChanged.call(this);
+      }, 500);
+      return result;
+    };
+
+    const getImageValue = function () {
+      const imageWidget = this.widgets?.find((widget) => widget.name === "image");
+      return imageWidget?.value ?? "";
+    };
+
+    const refreshMetadata = async function (attempt = 0) {
+      if (!this._dtvTextWidgets) {
+        return;
+      }
+
+      const image = getImageValue.call(this);
+      if (!image) {
+        return;
+      }
+      this._dtvLastRefreshImage = image;
+      this._dtvRefreshToken = (this._dtvRefreshToken ?? 0) + 1;
+      const refreshToken = this._dtvRefreshToken;
+
+      try {
+        const response = await fetch(
+          `/dtv_restore_prompts/read_metadata?image=${encodeURIComponent(image)}`
+        );
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error ?? "Failed to read metadata");
+        }
+
+        if (refreshToken !== this._dtvRefreshToken) {
+          return;
+        }
+        setWidgetValue(this._dtvTextWidgets.parameters, data.parameters);
+        this.setDirtyCanvas(true, true);
+      } catch (error) {
+        const fileMayStillBeUploading =
+          error.message.includes("No such file or directory") ||
+          error.message.includes("File not found") ||
+          error.message.includes("404");
+
+        if (fileMayStillBeUploading && attempt < 20) {
+          window.setTimeout(() => {
+            if (image === getImageValue.call(this)) {
+              refreshMetadata.call(this, attempt + 1);
+            }
+          }, 500);
+          return;
+        }
+
+        if (refreshToken !== this._dtvRefreshToken) {
+          return;
+        }
+        setWidgetValue(this._dtvTextWidgets.parameters, `Metadata read failed: ${error.message}`);
+        this.setDirtyCanvas(true, true);
+      }
+    };
+
+    const refreshMetadataIfImageChanged = function () {
+      const image = getImageValue.call(this);
+      if (image && image !== this._dtvLastSeenImage) {
+        this._dtvLastSeenImage = image;
+        refreshMetadata.call(this);
+      }
+    };
+
+    const onExecuted = nodeType.prototype.onExecuted;
+    nodeType.prototype.onExecuted = function (message) {
+      onExecuted?.apply(this, arguments);
+      if (!this._dtvTextWidgets || !message) {
+        return;
+      }
+      setWidgetValue(this._dtvTextWidgets.parameters, message.parameters?.[0]);
+      this.setDirtyCanvas(true, true);
+    };
+
+    const onWidgetChanged = nodeType.prototype.onWidgetChanged;
+    nodeType.prototype.onWidgetChanged = function (name, value, oldValue, widget) {
+      const result = onWidgetChanged?.apply(this, arguments);
+      if (name === "image" && value !== oldValue) {
+        this._dtvLastSeenImage = value;
+        refreshMetadata.call(this);
+      }
+      return result;
+    };
+
+    const onDrawForeground = nodeType.prototype.onDrawForeground;
+    nodeType.prototype.onDrawForeground = function () {
+      onDrawForeground?.apply(this, arguments);
+      refreshMetadataIfImageChanged.call(this);
+    };
+
+    const onRemoved = nodeType.prototype.onRemoved;
+    nodeType.prototype.onRemoved = function () {
+      if (this._dtvImageWatchTimer) {
+        window.clearInterval(this._dtvImageWatchTimer);
+        this._dtvImageWatchTimer = null;
+      }
+      return onRemoved?.apply(this, arguments);
+    };
+  },
+});
