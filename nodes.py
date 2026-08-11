@@ -5,11 +5,12 @@ import time
 
 import numpy as np
 from PIL import Image
-from PIL.ExifTags import Base
+from PIL.ExifTags import Base, IFD, TAGS
 from PIL.PngImagePlugin import PngInfo
 from aiohttp import web
 
 import folder_paths
+from comfy_api.latest import Input, Types, io, ui
 from comfy.cli_args import args
 from server import PromptServer
 
@@ -31,18 +32,213 @@ def _node_title(node):
 
 def _is_negative_clip_node(node):
     title = _node_title(node)
-    return "negative" in title or "neg" in title
+    return bool(re.search(r"(^|[^a-z0-9])(negative|neg)([^a-z0-9]|$)", title))
 
 
 def _is_positive_clip_node(node):
     title = _node_title(node)
-    return "positive" in title or "pos" in title
+    return bool(re.search(r"(^|[^a-z0-9])(positive|pos)([^a-z0-9]|$)", title))
+
+
+def _is_link_value(value):
+    return (
+        isinstance(value, list)
+        and len(value) >= 2
+        and isinstance(value[0], (str, int))
+        and isinstance(value[1], int)
+    )
+
+
+def _normalize_prompt_graph(prompt):
+    prompt = _json_loads_maybe(prompt)
+    if not isinstance(prompt, dict):
+        return None
+
+    normalized_nodes = {}
+
+    def collect_graph(graph):
+        if not isinstance(graph, dict) or not isinstance(graph.get("nodes"), list):
+            return
+
+        link_sources = {}
+        for link in graph.get("links", []):
+            if isinstance(link, list) and len(link) >= 3:
+                link_sources[str(link[0])] = [str(link[1]), int(link[2])]
+            elif isinstance(link, dict):
+                link_id = link.get("id")
+                origin_id = link.get("origin_id")
+                origin_slot = link.get("origin_slot", 0)
+                if link_id is not None and origin_id is not None:
+                    link_sources[str(link_id)] = [str(origin_id), int(origin_slot)]
+
+        for node in graph.get("nodes", []):
+            if not isinstance(node, dict) or node.get("id") is None:
+                continue
+
+            inputs = {}
+            widget_index = 0
+            widgets_values = node.get("widgets_values", []) or []
+            for input_info in node.get("inputs", []) or []:
+                if not isinstance(input_info, dict):
+                    continue
+                name = input_info.get("name")
+                link = input_info.get("link")
+                if name and link is not None and str(link) in link_sources:
+                    inputs[str(name)] = link_sources[str(link)]
+                elif name and input_info.get("widget") is not None and widget_index < len(widgets_values):
+                    inputs[str(name)] = widgets_values[widget_index]
+                    widget_index += 1
+
+            normalized_nodes[str(node["id"])] = {
+                "class_type": node.get("type") or node.get("class_type"),
+                "_meta": {"title": node.get("title") or node.get("properties", {}).get("Node name for S&R", "")},
+                "inputs": inputs,
+                "widgets_values": widgets_values,
+            }
+
+    def walk(value):
+        if isinstance(value, dict):
+            collect_graph(value)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(prompt)
+
+    if normalized_nodes:
+        return normalized_nodes
+
+    return prompt
+
+
+def _node_input_link_ids(node, input_name):
+    value = node.get("inputs", {}).get(input_name)
+    if _is_link_value(value):
+        return [str(value[0])]
+    if isinstance(value, list):
+        return [str(item[0]) for item in value if _is_link_value(item)]
+    return []
+
+
+def _first_widget_string(node):
+    for value in node.get("widgets_values", []) or []:
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _resolve_text_input(prompt, value, visited):
+    if isinstance(value, str):
+        return value
+    if _is_link_value(value):
+        return _resolve_node_text(prompt, value[0], visited)
+    return ""
+
+
+def _resolve_node_text(prompt, node_id, visited=None):
+    if visited is None:
+        visited = set()
+
+    node_id = str(node_id)
+    if node_id in visited:
+        return []
+    visited.add(node_id)
+
+    node = prompt.get(node_id)
+    if not isinstance(node, dict):
+        return ""
+
+    inputs = node.get("inputs", {})
+    class_type = node.get("class_type")
+
+    if class_type == "CLIPTextEncode":
+        text = _resolve_text_input(prompt, inputs.get("text", ""), visited)
+        return text or _first_widget_string(node)
+
+    if class_type == "StringConcatenate":
+        string_a = _resolve_text_input(prompt, inputs.get("string_a", ""), visited)
+        string_b = _resolve_text_input(prompt, inputs.get("string_b", ""), visited)
+        delimiter = _resolve_text_input(prompt, inputs.get("delimiter", ""), visited)
+        if not string_a and not string_b:
+            values = [value for value in (node.get("widgets_values", []) or []) if isinstance(value, str)]
+            string_a = values[0] if len(values) > 0 else ""
+            string_b = values[1] if len(values) > 1 else ""
+            delimiter = values[2] if len(values) > 2 else delimiter
+        if string_a and string_b:
+            return f"{string_a}{delimiter}{string_b}"
+        return string_a or string_b
+
+    if isinstance(class_type, str) and class_type.startswith("TextGenerate"):
+        return _resolve_text_input(prompt, inputs.get("prompt", ""), visited)
+
+    for input_name in ("text", "prompt", "string", "string_a", "string_b", "value", "generated_text"):
+        text = _resolve_text_input(prompt, inputs.get(input_name, ""), visited)
+        if text:
+            return text
+
+    return _first_widget_string(node)
+
+
+def _trace_clip_texts(prompt, node_id, visited=None):
+    node_id = str(node_id)
+    node = prompt.get(node_id)
+    if not isinstance(node, dict):
+        return []
+
+    if node.get("class_type") == "CLIPTextEncode":
+        text = _resolve_node_text(prompt, node_id, visited)
+        return [text] if text else []
+
+    if visited is None:
+        visited = set()
+    if node_id in visited:
+        return []
+    visited.add(node_id)
+
+    texts = []
+    for value in node.get("inputs", {}).values():
+        if _is_link_value(value):
+            texts.extend(_trace_clip_texts(prompt, value[0], visited))
+    return texts
+
+
+def _extract_clip_prompts_from_links(prompt):
+    positive = ""
+    negative = ""
+
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+
+        for node_id in _node_input_link_ids(node, "positive"):
+            for text in _trace_clip_texts(prompt, node_id):
+                if text and not positive:
+                    positive = text
+
+        for node_id in _node_input_link_ids(node, "negative"):
+            for text in _trace_clip_texts(prompt, node_id):
+                if text and not negative:
+                    negative = text
+
+        if positive and negative:
+            return positive, negative
+
+    return positive, negative
 
 
 def _extract_clip_prompts(prompt):
-    prompt = _json_loads_maybe(prompt)
+    prompt = _normalize_prompt_graph(prompt)
     if not isinstance(prompt, dict):
         return "", ""
+
+    positive, negative = _extract_clip_prompts_from_links(prompt)
+    if positive or negative:
+        return positive, negative
 
     clips = []
     for node_id, node in prompt.items():
@@ -50,8 +246,8 @@ def _extract_clip_prompts(prompt):
             continue
         if node.get("class_type") != "CLIPTextEncode":
             continue
-        text = node.get("inputs", {}).get("text", "")
-        if isinstance(text, str):
+        text = _resolve_node_text(prompt, node_id)
+        if text:
             clips.append((str(node_id), node, text))
 
     positive = ""
@@ -75,7 +271,7 @@ def _extract_clip_prompts(prompt):
 
 
 def _find_first_input(prompt, class_names, input_names):
-    prompt = _json_loads_maybe(prompt)
+    prompt = _normalize_prompt_graph(prompt)
     if not isinstance(prompt, dict):
         return None
     for node in prompt.values():
@@ -162,16 +358,22 @@ def _decode_exif_text(value):
     if value is None:
         return ""
     if isinstance(value, bytes):
-        prefixes = [
-            b"UNICODE\x00",
-            b"ASCII\x00\x00\x00",
-            b"JIS\x00\x00\x00\x00\x00",
-        ]
-        for prefix in prefixes:
-            if value.startswith(prefix):
-                value = value[len(prefix):]
-                break
-        for encoding in ("utf-16-be", "utf-16-le", "utf-8", "latin-1"):
+        if value.startswith((b"Exif\x00\x00", b"MM\x00*", b"II*\x00")):
+            return ""
+
+        if value.startswith(b"UNICODE\x00"):
+            value = value[len(b"UNICODE\x00"):]
+            encodings = ("utf-16-be", "utf-16-le", "utf-8", "latin-1")
+        elif value.startswith(b"ASCII\x00\x00\x00"):
+            value = value[len(b"ASCII\x00\x00\x00"):]
+            encodings = ("utf-8", "latin-1")
+        elif value.startswith(b"JIS\x00\x00\x00\x00\x00"):
+            value = value[len(b"JIS\x00\x00\x00\x00\x00"):]
+            encodings = ("shift_jis", "utf-8", "latin-1")
+        else:
+            encodings = ("utf-8", "utf-16-be", "utf-16-le", "latin-1")
+
+        for encoding in encodings:
             try:
                 return value.decode(encoding).strip("\x00").strip()
             except Exception:
@@ -180,13 +382,124 @@ def _decode_exif_text(value):
     return str(value)
 
 
+def _decode_xp_exif_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip("\x00").strip()
+    if isinstance(value, (tuple, list)):
+        try:
+            value = bytes(int(item) for item in value if int(item) >= 0)
+        except Exception:
+            return ""
+    if isinstance(value, bytes):
+        for encoding in ("utf-16-le", "utf-16-be", "utf-8", "latin-1"):
+            try:
+                return value.decode(encoding).strip("\x00").strip()
+            except Exception:
+                pass
+    return ""
+
+
+def _exif_tag_name(tag):
+    try:
+        return TAGS.get(int(tag), str(tag))
+    except Exception:
+        return str(tag)
+
+
+def _load_exif_bytes(value):
+    if not isinstance(value, bytes):
+        return None
+
+    for candidate in (value, value[6:] if value.startswith(b"Exif\x00\x00") else value):
+        try:
+            exif = Image.Exif()
+            exif.load(candidate)
+            if exif:
+                return exif
+        except Exception:
+            pass
+    return None
+
+
+def _load_exif_text(value):
+    if not isinstance(value, str):
+        return None
+
+    for encoding in ("utf-16-be", "utf-16-le", "latin-1"):
+        try:
+            exif = _load_exif_bytes(value.encode(encoding))
+            if exif:
+                return exif
+        except Exception:
+            pass
+    return None
+
+
+def _merge_exif_metadata(metadata, exif):
+    if not exif:
+        return
+
+    xp_tags = {
+        40091: "XPTitle",
+        40092: "XPComment",
+        40093: "XPAuthor",
+        40094: "XPKeywords",
+        40095: "XPSubject",
+    }
+
+    exif_map = {
+        "ImageDescription": exif.get(Base.ImageDescription),
+        "UserComment": exif.get(Base.UserComment),
+        "Software": exif.get(Base.Software),
+    }
+    for key, value in exif_map.items():
+        text = _decode_exif_text(value)
+        if text and key not in metadata:
+            metadata[key] = text
+
+    all_items = []
+    try:
+        all_items.extend(list(exif.items()))
+    except Exception:
+        pass
+
+    for ifd in (IFD.Exif, IFD.GPSInfo, IFD.Interop, IFD.IFD1):
+        try:
+            all_items.extend(list(exif.get_ifd(ifd).items()))
+        except Exception:
+            pass
+
+    for tag, value in all_items:
+        key = xp_tags.get(int(tag), _exif_tag_name(tag))
+        if key in metadata:
+            continue
+        if int(tag) in xp_tags:
+            text = _decode_xp_exif_text(value)
+        elif isinstance(value, (str, bytes)):
+            text = _decode_exif_text(value)
+        elif isinstance(value, (tuple, list)) and value and all(isinstance(item, int) for item in value):
+            text = _decode_xp_exif_text(value)
+        else:
+            text = ""
+        if text:
+            metadata[key] = text
+
+
 def _read_image_metadata(image_path):
     with Image.open(image_path) as img:
         metadata = {}
 
         for key, value in img.info.items():
-            if isinstance(value, bytes):
+            if isinstance(value, bytes) and str(key).lower() == "exif":
+                _merge_exif_metadata(metadata, _load_exif_bytes(value))
+                metadata[str(key)] = f"<binary EXIF: {len(value)} bytes>"
+            elif isinstance(value, bytes):
                 metadata[str(key)] = _decode_exif_text(value)
+            elif isinstance(value, str) and str(key).lower() == "exif":
+                _merge_exif_metadata(metadata, _load_exif_text(value))
+                metadata[str(key)] = "<binary EXIF text>"
             elif isinstance(value, str):
                 metadata[str(key)] = value
 
@@ -196,15 +509,7 @@ def _read_image_metadata(image_path):
             exif = None
 
         if exif:
-            exif_map = {
-                "ImageDescription": exif.get(Base.ImageDescription),
-                "UserComment": exif.get(Base.UserComment),
-                "Software": exif.get(Base.Software),
-            }
-            for key, value in exif_map.items():
-                text = _decode_exif_text(value)
-                if text and key not in metadata:
-                    metadata[key] = text
+            _merge_exif_metadata(metadata, exif)
 
         # JPEG output from DTVSaveImageWithMeta stores the same key/value
         # metadata as PNG in ImageDescription, wrapped as JSON.
@@ -215,13 +520,39 @@ def _read_image_metadata(image_path):
                 metadata.update(saved_metadata)
 
         if "parameters" not in metadata:
-            for key in ("UserComment", "ImageDescription", "comment", "Comment", "Description"):
-                value = metadata.get(key)
+            preferred_keys = (
+                "parameters",
+                "UserComment",
+                "ImageDescription",
+                "XPComment",
+                "XPSubject",
+                "XPTitle",
+                "comment",
+                "Comment",
+                "Description",
+            )
+            values = [metadata.get(key) for key in preferred_keys]
+            values.extend(value for key, value in metadata.items() if key not in preferred_keys)
+            for value in values:
                 if value and ("Negative prompt:" in value or "Steps:" in value):
                     metadata["parameters"] = value
                     break
 
         return metadata
+
+
+def _annotated_image_name(filename, subfolder=None, folder_type=None):
+    if not filename:
+        return ""
+
+    filename = str(filename)
+    if subfolder:
+        filename = os.path.join(str(subfolder), filename)
+
+    if folder_type in {"input", "output", "temp"} and not re.search(r"\s\[(input|output|temp)\]$", filename):
+        filename = f"{filename} [{folder_type}]"
+
+    return filename
 
 
 def _extract_prompts_from_metadata(metadata):
@@ -230,8 +561,10 @@ def _extract_prompts_from_metadata(metadata):
 
     if not positive and not negative:
         positive, negative = _extract_clip_prompts(metadata.get("prompt"))
+        if not positive and not negative:
+            positive, negative = _extract_clip_prompts(metadata.get("workflow"))
         if not parameters:
-            parameters = _build_parameters(metadata.get("prompt"))
+            parameters = _build_parameters(metadata.get("prompt")) or _build_parameters(metadata.get("workflow"))
 
     raw_metadata = json.dumps(metadata, ensure_ascii=False, indent=2)
     display = (
@@ -406,14 +739,112 @@ class DTVReadPromptsFromPNGMetadata:
         }
 
 
+class DTVSaveVideo(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="DTVSaveVideo",
+            search_aliases=["save video", "export video", "dtv save video"],
+            display_name="DTV Save Video",
+            category="DTV Restore Prompts",
+            description="Saves the input videos to your ComfyUI output directory and allows the preview component to be resized smaller.",
+            inputs=[
+                io.Video.Input("video", tooltip="The video to save."),
+                io.String.Input(
+                    "filename_prefix",
+                    default="video/ComfyUI",
+                    tooltip="The prefix for the file to save. This may include formatting information such as %date:yyyy-MM-dd% or %Empty Latent Image.width% to include values from nodes.",
+                ),
+                io.Combo.Input(
+                    "format",
+                    options=Types.VideoContainer.as_input(),
+                    default="auto",
+                    tooltip="The format to save the video as.",
+                ),
+                io.DynamicCombo.Input(
+                    "codec",
+                    options=[
+                        io.DynamicCombo.Option("auto", []),
+                        io.DynamicCombo.Option(
+                            "h264",
+                            [
+                                io.DynamicCombo.Input(
+                                    "encoding",
+                                    display_name="encoding mode",
+                                    options=[
+                                        io.DynamicCombo.Option("auto", []),
+                                        io.DynamicCombo.Option(
+                                            "re-encode",
+                                            [
+                                                io.Float.Input(
+                                                    "crf",
+                                                    default=23.0,
+                                                    min=0.0,
+                                                    max=51.0,
+                                                    step=1.0,
+                                                    tooltip="Lower values produce higher quality and larger files.",
+                                                )
+                                            ],
+                                        ),
+                                    ],
+                                    optional=True,
+                                    tooltip="Automatic preserves compatible H.264 streams. Re-encode applies a custom CRF.",
+                                ),
+                            ],
+                        ),
+                    ],
+                    tooltip="The codec to use for the video.",
+                ),
+            ],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+            is_output_node=True,
+            outputs=[io.Video.Output("video")],
+        )
+
+    @classmethod
+    def execute(cls, video: Input.Video, filename_prefix, format: str, codec: io.DynamicCombo.Type) -> io.NodeOutput:
+        codec_name = codec["codec"]
+        encoding = codec.get("encoding") or {}
+        width, height = video.get_dimensions()
+        filename_prefix = _expand_date_tokens(filename_prefix)
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
+            filename_prefix,
+            folder_paths.get_output_directory(),
+            width,
+            height,
+        )
+        saved_metadata = None
+        if not args.disable_metadata:
+            metadata = {}
+            if cls.hidden.extra_pnginfo is not None:
+                metadata.update(cls.hidden.extra_pnginfo)
+            if cls.hidden.prompt is not None:
+                metadata["prompt"] = cls.hidden.prompt
+            if len(metadata) > 0:
+                saved_metadata = metadata
+
+        file = f"{filename}_{counter:05}_.{Types.VideoContainer.get_extension(format)}"
+        video.save_to(
+            os.path.join(full_output_folder, file),
+            format=Types.VideoContainer(format),
+            codec=codec_name,
+            metadata=saved_metadata,
+            crf=encoding.get("crf"),
+        )
+
+        return io.NodeOutput(video, ui=ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)]))
+
+
 @PromptServer.instance.routes.get("/dtv_restore_prompts/read_metadata")
 async def read_metadata_route(request):
     image = request.rel_url.query.get("image")
+    subfolder = request.rel_url.query.get("subfolder")
+    folder_type = request.rel_url.query.get("type")
     if not image:
         return web.json_response({"error": "Missing image"}, status=400)
 
     try:
-        image_path = folder_paths.get_annotated_filepath(image)
+        image_path = folder_paths.get_annotated_filepath(_annotated_image_name(image, subfolder, folder_type))
         parsed = _extract_prompts_from_metadata(_read_image_metadata(image_path))
         return web.json_response(parsed)
     except FileNotFoundError as err:
@@ -425,9 +856,11 @@ async def read_metadata_route(request):
 NODE_CLASS_MAPPINGS = {
     "DTVSaveImageWithMeta": DTVSaveImageWithMeta,
     "DTVReadPromptsFromPNGMetadata": DTVReadPromptsFromPNGMetadata,
+    "DTVSaveVideo": DTVSaveVideo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DTVSaveImageWithMeta": "DTV Save Image (Save meta)",
     "DTVReadPromptsFromPNGMetadata": "DTV Read Prompts From PNG Metadata",
+    "DTVSaveVideo": "DTV Save Video",
 }

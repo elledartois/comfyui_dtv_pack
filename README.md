@@ -19,6 +19,17 @@ Saves generated images while preserving prompt metadata.
 - Keeps ComfyUI prompt metadata when metadata saving is enabled
 - Supports date tokens in `filename_prefix`, for example `%date:yyyyMMdd_HHmmss%`
 
+### DTV Save Video
+
+標準のSave Videoノードをベースにした動画保存ノードです｡標準ノードでは動画プレビュー部分が実サイズに引っ張られて小さくできない場合がありますが､このノードではコンポーネントの縮小表示を許可しています｡
+
+Video save node based on ComfyUI's standard Save Video node.
+
+- Saves input videos to the ComfyUI output directory
+- Supports the same format / codec options as the standard Save Video node
+- Supports date tokens in `filename_prefix`, for example `%date:yyyyMMdd_HHmmss%`
+- Allows the video preview component to be resized smaller than the actual video size
+
 ### DTV Read Prompts From PNG Metadata
 
 "DTV Save Image"ノードで保存した画像にあるメタデータテキストを表示させるだけのノードです｡
