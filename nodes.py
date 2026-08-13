@@ -10,8 +10,8 @@ from PIL.PngImagePlugin import PngInfo
 from aiohttp import web
 
 import folder_paths
-from comfy_api.latest import Input, Types, io, ui
 from comfy.cli_args import args
+from comfy_extras.nodes_video import SaveVideo as ComfySaveVideo
 from server import PromptServer
 
 
@@ -143,7 +143,7 @@ def _resolve_node_text(prompt, node_id, visited=None):
 
     node_id = str(node_id)
     if node_id in visited:
-        return []
+        return ""
     visited.add(node_id)
 
     node = prompt.get(node_id)
@@ -739,100 +739,25 @@ class DTVReadPromptsFromPNGMetadata:
         }
 
 
-class DTVSaveVideo(io.ComfyNode):
+class DTVSaveVideo(ComfySaveVideo):
     @classmethod
     def define_schema(cls):
-        return io.Schema(
-            node_id="DTVSaveVideo",
-            search_aliases=["save video", "export video", "dtv save video"],
-            display_name="DTV Save Video",
-            category="DTV Restore Prompts",
-            description="Saves the input videos to your ComfyUI output directory and allows the preview component to be resized smaller.",
-            inputs=[
-                io.Video.Input("video", tooltip="The video to save."),
-                io.String.Input(
-                    "filename_prefix",
-                    default="video/ComfyUI",
-                    tooltip="The prefix for the file to save. This may include formatting information such as %date:yyyy-MM-dd% or %Empty Latent Image.width% to include values from nodes.",
-                ),
-                io.Combo.Input(
-                    "format",
-                    options=Types.VideoContainer.as_input(),
-                    default="auto",
-                    tooltip="The format to save the video as.",
-                ),
-                io.DynamicCombo.Input(
-                    "codec",
-                    options=[
-                        io.DynamicCombo.Option("auto", []),
-                        io.DynamicCombo.Option(
-                            "h264",
-                            [
-                                io.DynamicCombo.Input(
-                                    "encoding",
-                                    display_name="encoding mode",
-                                    options=[
-                                        io.DynamicCombo.Option("auto", []),
-                                        io.DynamicCombo.Option(
-                                            "re-encode",
-                                            [
-                                                io.Float.Input(
-                                                    "crf",
-                                                    default=23.0,
-                                                    min=0.0,
-                                                    max=51.0,
-                                                    step=1.0,
-                                                    tooltip="Lower values produce higher quality and larger files.",
-                                                )
-                                            ],
-                                        ),
-                                    ],
-                                    optional=True,
-                                    tooltip="Automatic preserves compatible H.264 streams. Re-encode applies a custom CRF.",
-                                ),
-                            ],
-                        ),
-                    ],
-                    tooltip="The codec to use for the video.",
-                ),
-            ],
-            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
-            is_output_node=True,
-            outputs=[io.Video.Output("video")],
+        schema = super().define_schema()
+        schema.node_id = "DTVSaveVideo"
+        schema.search_aliases = ["save video", "export video", "dtv save video"]
+        schema.display_name = "DTV Save Video"
+        schema.category = "DTV Restore Prompts"
+        schema.essentials_category = None
+        schema.description = (
+            "Saves the input videos to your ComfyUI output directory and allows "
+            "the preview component to be resized smaller."
         )
+        return schema
 
     @classmethod
-    def execute(cls, video: Input.Video, filename_prefix, format: str, codec: io.DynamicCombo.Type) -> io.NodeOutput:
-        codec_name = codec["codec"]
-        encoding = codec.get("encoding") or {}
-        width, height = video.get_dimensions()
+    def execute(cls, video, filename_prefix, *args, **kwargs):
         filename_prefix = _expand_date_tokens(filename_prefix)
-        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(
-            filename_prefix,
-            folder_paths.get_output_directory(),
-            width,
-            height,
-        )
-        saved_metadata = None
-        if not args.disable_metadata:
-            metadata = {}
-            if cls.hidden.extra_pnginfo is not None:
-                metadata.update(cls.hidden.extra_pnginfo)
-            if cls.hidden.prompt is not None:
-                metadata["prompt"] = cls.hidden.prompt
-            if len(metadata) > 0:
-                saved_metadata = metadata
-
-        file = f"{filename}_{counter:05}_.{Types.VideoContainer.get_extension(format)}"
-        video.save_to(
-            os.path.join(full_output_folder, file),
-            format=Types.VideoContainer(format),
-            codec=codec_name,
-            metadata=saved_metadata,
-            crf=encoding.get("crf"),
-        )
-
-        return io.NodeOutput(video, ui=ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.output)]))
+        return super().execute(video, filename_prefix, *args, **kwargs)
 
 
 @PromptServer.instance.routes.get("/dtv_restore_prompts/read_metadata")
