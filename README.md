@@ -20,7 +20,7 @@ Saves generated images while preserving prompt metadata.
 - Supports date tokens in `filename_prefix`, for example `%date:yyyyMMdd_HHmmss%`
 
 ### DTV Save Video
-
+※現在MiniMax H3 Reference to Videoノードとの相性が悪く､生成時間が大幅に伸びたり､参照に失敗したりします｡DTV Save Videoは使用しないでください｡
 標準のSave Videoノードをベースにした動画保存ノードです｡標準ノードでは動画プレビュー部分が実サイズに引っ張られて小さくできない場合がありますが､このノードではコンポーネントの縮小表示を許可しています｡
 
 Video save node based on ComfyUI's standard Save Video node.
